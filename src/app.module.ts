@@ -15,6 +15,7 @@ import { TenantModule } from './tenant/tenant.module';
 import { RedisModule } from './redis/redis.module';
 import { ChatModule } from './chat/chat.module';
 import { NotificationModule } from './notification/notification.module';
+import { WhatsappModule } from './whatsapp/whatsapp.module';
 
 @Module({
   imports: [
@@ -44,6 +45,7 @@ import { NotificationModule } from './notification/notification.module';
     RedisModule,
     ChatModule,
     NotificationModule,
+    WhatsappModule,
   ],
   providers: [
     {
