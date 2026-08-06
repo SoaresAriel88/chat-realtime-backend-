@@ -42,7 +42,7 @@ export class ConversationController {
           ? {
               content: lastMessage.content,
               createdAt: lastMessage.createdAt,
-              authorName: lastMessage.author.name,
+              authorName: lastMessage.author?.name ?? 'Cliente',
             }
           : undefined,
       };

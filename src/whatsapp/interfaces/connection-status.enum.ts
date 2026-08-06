@@ -1,6 +1,0 @@
-export enum ConnectionStatus {
-  DISCONNECTED = 'DISCONNECTED',
-  CONNECTING = 'CONNECTING',
-  WAITING_QR = 'WAITING_QR',
-  CONNECTED = 'CONNECTED',
-}

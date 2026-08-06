@@ -410,11 +410,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         room: roomId,
         conversationId: roomId,
         authorId: savedMessage.authorId,
-        author: {
-          id: savedMessage.author.id,
-          name: savedMessage.author.name,
-          status: 'online',
-        },
+        author: savedMessage.author
+          ? {
+              id: savedMessage.author.id,
+              name: savedMessage.author.name,
+              status: 'online',
+            }
+          : null,
         content: savedMessage.content,
         createdAt: savedMessage.createdAt,
       };
@@ -455,7 +457,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         if (!onlineUser) {
           await this.notificationService.sendPushToUser(
             participant.user.id,
-            `Nova mensagem de ${savedMessage.author.name}`,
+            `Nova mensagem de ${savedMessage.author?.name ?? 'Cliente'}`,
             savedMessage.content ?? 'Você recebeu uma nova mensagem',
           );
         }
@@ -717,18 +719,21 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       id: string;
       tenantId: string;
       conversationId: string;
-      authorId: string;
-      author: {
+      authorId: string | null;
+      author?: {
         id: string;
         name: string;
-      };
+      } | null;
+
       type: string;
       content: string | null;
+
       fileUrl: string | null;
       fileName: string | null;
       mimeType: string | null;
       fileSize: number | null;
       audioDuration: number | null;
+
       createdAt: Date;
     },
   ) {
@@ -740,11 +745,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       conversationId: message.conversationId,
 
       authorId: message.authorId,
-      author: {
-        id: message.author.id,
-        name: message.author.name,
-        status: 'online',
-      },
+      author: message.author
+        ? {
+            id: message.author.id,
+            name: message.author.name,
+            status: 'online',
+          }
+        : null,
 
       type: message.type,
       content: message.content,

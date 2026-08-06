@@ -18,6 +18,18 @@ enum MessageType {
   AUDIO
 }
 
+enum Status {
+  ACTIVE
+  INACTIVE
+}
+
+enum ChannelType {
+  WHATSAPP
+  INSTAGRAM
+  TELEGRAM
+  WEBSITE
+}
+
 model Tenant {
   id        String    @id @default(uuid())
   name      String
@@ -32,6 +44,8 @@ model Tenant {
   messages                 Message[]
   roles                    Role[]
   categories               Category[]
+  contacts                 Contact[]
+  channels                 Channel[]
 }
 
 model User {
@@ -79,35 +93,86 @@ model UserDevice {
   @@index([userId])
 }
 
-model WhatsappMessage {
+model Contact {
   id String @id @default(uuid())
+
+  name String?
 
   tenantId String
 
-  remoteJid String
+  tenant Tenant @relation(fields: [tenantId], references: [id])
 
-  messageId String
+  conversations Conversation[]
 
-  pushName String?
+  messages Message[]
 
-  text String?
-
-  fromMe Boolean
+  identities ContactIdentity[]
 
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+}
+
+model ContactIdentity {
+  id String @id @default(uuid())
+
+  contactId String
+
+  contact Contact @relation(fields: [contactId], references: [id])
+
+  channel ChannelType
+
+  externalId String
+
+  createdAt DateTime @default(now())
+
+  @@unique([channel, externalId])
+}
+
+model Channel {
+  id String @id @default(uuid())
+
+  name String
+
+  type ChannelType
+
+  settings Json?
+
+  tenantId String
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  conversations Conversation[]
+
+  createdAt DateTime @default(now())
+
+  updatedAt DateTime @updatedAt
 }
 
 model Conversation {
-  id   String @id @default(uuid())
+  id String @id @default(uuid())
+
   name String
 
   tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
 
   participants ConversationParticipant[]
-  messages     Message[]
+
+  messages Message[]
+
+  contactId String?
+
+  contact Contact? @relation(fields: [contactId], references: [id])
+
+  channelId String?
+
+  channel Channel? @relation(fields: [channelId], references: [id])
 
   createdAt DateTime @default(now())
+
   updatedAt DateTime @updatedAt
 
   @@unique([id, tenantId])
@@ -143,7 +208,8 @@ model ConversationParticipant {
 model Message {
   id String @id @default(uuid())
 
-  type    MessageType @default(TEXT)
+  type MessageType @default(TEXT)
+
   content String?
 
   fileUrl  String?
@@ -154,16 +220,23 @@ model Message {
   audioDuration Int?
 
   conversationId String
-  authorId       String
-  tenantId       String
+
+  authorId String?
+
+  contactId String?
+
+  tenantId String
 
   conversation Conversation @relation(fields: [conversationId, tenantId], references: [id, tenantId])
 
-  author User @relation(fields: [authorId, tenantId], references: [id, tenantId])
+  author User? @relation(fields: [authorId, tenantId], references: [id, tenantId])
+
+  contact Contact? @relation(fields: [contactId], references: [id])
 
   tenant Tenant @relation(fields: [tenantId], references: [id])
 
   createdAt DateTime @default(now())
+
   updatedAt DateTime @updatedAt
 
   @@index([tenantId])
@@ -195,11 +268,6 @@ model Permission {
   deletedAt DateTime?
 
   roles Role[] @relation("RolePermissions")
-}
-
-enum Status {
-  ACTIVE
-  INACTIVE
 }
 
 model Category {
