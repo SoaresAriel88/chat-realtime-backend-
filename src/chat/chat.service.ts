@@ -262,10 +262,6 @@ export class ChatService {
     };
   }
 
-  // ============================================================
-  // PARTICIPANTS
-  // ============================================================
-
   async findConversationParticipants(
     conversationId: string,
     tenantId: string,
