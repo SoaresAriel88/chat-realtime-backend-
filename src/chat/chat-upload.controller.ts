@@ -19,23 +19,28 @@ import { JwtAuthGuard } from 'src/auth/jwt-auth.guard';
 import { ChatService } from './chat.service';
 import { ChatGateway } from './chat.gateway';
 
-type AuthenticatedRequest = {
+interface AuthenticatedRequest {
   user: {
     id: string;
     email: string;
     tenantId: string;
   };
-};
+}
 
-const allowedMimeTypes = [
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
+
+const ALLOWED_MIME_TYPES = [
+  // Imagens
   'image/jpeg',
   'image/png',
   'image/webp',
 
+  // Documentos
   'application/pdf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 
+  // Áudio
   'audio/webm',
   'audio/ogg',
   'audio/mpeg',
@@ -49,6 +54,10 @@ export class ChatUploadController {
     private readonly chatGateway: ChatGateway,
   ) {}
 
+  // ============================================================
+  // UPLOAD DE ANEXO
+  // ============================================================
+
   @Post('conversations/:conversationId/attachments')
   @UseGuards(JwtAuthGuard)
   @UseInterceptors(
@@ -58,7 +67,6 @@ export class ChatUploadController {
 
         filename: (_request, file, callback) => {
           const extension = extname(file.originalname).toLowerCase();
-
           const fileName = `${randomUUID()}${extension}`;
 
           callback(null, fileName);
@@ -66,15 +74,15 @@ export class ChatUploadController {
       }),
 
       limits: {
-        fileSize: 10 * 1024 * 1024,
+        fileSize: MAX_FILE_SIZE,
       },
 
       fileFilter: (_request, file, callback) => {
-        const isAllowed = allowedMimeTypes.includes(file.mimetype);
-
-        if (!isAllowed) {
+        if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
           callback(
-            new BadRequestException('Tipo de arquivo não permitido'),
+            new BadRequestException(
+              `Tipo de arquivo não permitido: ${file.mimetype}`,
+            ),
             false,
           );
 
@@ -91,29 +99,41 @@ export class ChatUploadController {
     @Req() request: AuthenticatedRequest,
   ) {
     if (!file) {
-      throw new BadRequestException('Arquivo não enviado');
+      throw new BadRequestException(
+        'Arquivo não enviado. O campo multipart deve ser "file".',
+      );
     }
 
     const messageType = this.resolveMessageType(file.mimetype);
 
     const fileUrl = `/uploads/chat/${file.filename}`;
 
-    const savedMessage = await this.chatService.saveMessageByConversation({
+    const savedMessage = await this.chatService.sendExternalAttachment({
       conversationId,
+
       tenantId: request.user.tenantId,
+
       authorId: request.user.id,
 
       type: messageType,
+
+      filePath: file.path,
+
       fileUrl,
+
       fileName: file.originalname,
+
       mimeType: file.mimetype,
+
       fileSize: file.size,
     });
 
-    this.chatGateway.emitNewMessage(savedMessage.conversationId, savedMessage);
-
     return savedMessage;
   }
+
+  // ============================================================
+  // RESOLVE TIPO DA MENSAGEM
+  // ============================================================
 
   private resolveMessageType(mimeType: string): MessageType {
     if (mimeType.startsWith('image/')) {

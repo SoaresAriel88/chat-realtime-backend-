@@ -30,6 +30,13 @@ enum ChannelType {
   WEBSITE
 }
 
+enum ChannelStatus {
+  DISCONNECTED
+  CONNECTING
+  CONNECTED
+  ERROR
+}
+
 model Tenant {
   id        String    @id @default(uuid())
   name      String
@@ -46,6 +53,7 @@ model Tenant {
   categories               Category[]
   contacts                 Contact[]
   channels                 Channel[]
+  whatsappGroups           WhatsAppGroup[]
 }
 
 model User {
@@ -137,13 +145,16 @@ model Channel {
 
   type ChannelType
 
+  status ChannelStatus @default(DISCONNECTED)
+
   settings Json?
 
   tenantId String
 
   tenant Tenant @relation(fields: [tenantId], references: [id])
 
-  conversations Conversation[]
+  conversations  Conversation[]
+  whatsappGroups WhatsAppGroup[]
 
   createdAt DateTime @default(now())
 
@@ -171,6 +182,9 @@ model Conversation {
 
   channel Channel? @relation(fields: [channelId], references: [id])
 
+  groupId String?
+  group   WhatsAppGroup? @relation(fields: [groupId], references: [id])
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
@@ -178,6 +192,25 @@ model Conversation {
   @@unique([id, tenantId])
   @@unique([tenantId, name])
   @@index([tenantId])
+}
+
+model WhatsAppGroup {
+  id         String  @id @default(uuid())
+  externalId String
+  name       String?
+  tenantId   String
+  channelId  String
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id])
+  channel       Channel        @relation(fields: [channelId], references: [id])
+  conversations Conversation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([tenantId, channelId, externalId])
+  @@index([tenantId])
+  @@index([channelId])
 }
 
 model ConversationParticipant {

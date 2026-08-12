@@ -35,9 +35,20 @@ export class ConversationController {
       return {
         id: conversation.id,
         tenantId: conversation.tenantId,
-        name: conversation.name,
+
+        // IMPORTANTE:
+        // null = chat interno
+        // valor = chat externo
+        channelId: conversation.channelId,
+
+        name:
+          conversation.channelId && conversation.contact
+            ? conversation.contact.name
+            : conversation.name,
+
         createdAt: conversation.createdAt,
         updatedAt: conversation.updatedAt,
+
         lastMessage: lastMessage
           ? {
               content: lastMessage.content,
@@ -83,6 +94,53 @@ export class ConversationController {
       conversationId: message.conversationId,
       author: message.author,
     }));
+  }
+  @Post(':id/messages')
+  async sendMessage(
+    @Param('id') id: string,
+    @Body() body: { message?: string },
+    @Req() req: any,
+  ) {
+    const tenantId: string = req.user.tenantId;
+    const authorId: string = req.user.id;
+
+    const message = body?.message?.trim();
+
+    if (!tenantId) {
+      throw new BadRequestException('Tenant inválido');
+    }
+
+    if (!authorId) {
+      throw new BadRequestException('Usuário autenticado inválido');
+    }
+
+    if (!message) {
+      throw new BadRequestException('Mensagem é obrigatória');
+    }
+
+    const savedMessage = await this.chatService.sendExternalMessage({
+      conversationId: id,
+      tenantId,
+      authorId,
+      message,
+    });
+
+    return {
+      id: savedMessage.id,
+      tenantId: savedMessage.tenantId,
+      conversationId: savedMessage.conversationId,
+      contactId: savedMessage.contactId,
+      type: savedMessage.type,
+      content: savedMessage.content,
+      fileUrl: savedMessage.fileUrl,
+      fileName: savedMessage.fileName,
+      mimeType: savedMessage.mimeType,
+      fileSize: savedMessage.fileSize,
+      audioDuration: savedMessage.audioDuration,
+      createdAt: savedMessage.createdAt,
+      authorId: savedMessage.authorId,
+      author: savedMessage.author,
+    };
   }
 
   @Post()

@@ -7,16 +7,25 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
+
 import { JwtService } from '@nestjs/jwt';
 import { Server, Socket } from 'socket.io';
+
 import type { SendMessagePayload } from './types/send-message-payload.type';
+
 import { ChatService } from './chat.service';
 import { PrismaService } from 'src/database/prisma.service';
 import { NotificationService } from 'src/notification/notification.service';
+import { ChatEventsService } from './chat-events.service';
+
+// ============================================================
+// TYPES
+// ============================================================
 
 type SocketAckResponse = {
   success: boolean;
   message: string;
+
   room?: {
     id: string;
     name: string;
@@ -24,7 +33,7 @@ type SocketAckResponse = {
   };
 };
 
-type SocketTypingStart = {
+type SocketTypingPayload = {
   room: string;
   tenantId: string;
   author: string;
@@ -54,8 +63,13 @@ type OnlineUserWithSockets = OnlineUser & {
   socketIds: Set<string>;
 };
 
+// ============================================================
+// GATEWAY
+// ============================================================
+
 @WebSocketGateway({
   transports: ['websocket'],
+
   cors: {
     origin: '*',
   },
@@ -64,6 +78,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server!: Server;
 
+  // ==========================================================
+  // ESTADO ONLINE
+  // ==========================================================
+
   private readonly onlineUsersByRoom = new Map<
     string,
     Map<string, OnlineUserWithSockets>
@@ -71,15 +89,59 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   private readonly roomsBySocket = new Map<string, Set<string>>();
 
+  // ==========================================================
+  // CONSTRUCTOR
+  // ==========================================================
+
   constructor(
     private readonly chatService: ChatService,
+    private readonly chatEvents: ChatEventsService,
     private readonly jwtService: JwtService,
     private readonly prisma: PrismaService,
     private readonly notificationService: NotificationService,
-  ) {}
+  ) {
+    this.registerChatEvents();
+  }
 
-  async handleConnection(client: Socket) {
+  // ==========================================================
+  // EVENTOS
+  // ==========================================================
+
+  private registerChatEvents(): void {
+    this.chatEvents.registerNewMessage((roomId, message) => {
+      this.emitNewMessage(roomId, message);
+    });
+
+    this.chatEvents.registerConversationUpdated(
+      (tenantId, conversation, message) => {
+        this.emitConversationUpdated(tenantId, conversation, message);
+      },
+    );
+
+    // ----------------------------------------------
+    // WhatsApp QR
+    // ----------------------------------------------
+
+    this.chatEvents.registerWhatsAppQr((channelId, qrCode) => {
+      this.emitWhatsAppQr(channelId, qrCode);
+    });
+
+    // ----------------------------------------------
+    // WhatsApp conexão
+    // ----------------------------------------------
+
+    this.chatEvents.registerWhatsAppConnection((channelId, status) => {
+      this.emitWhatsAppConnection(channelId, status);
+    });
+  }
+
+  // ==========================================================
+  // CONNECTION
+  // ==========================================================
+
+  async handleConnection(client: Socket): Promise<void> {
     const token = this.extractTokenFromSocket(client);
+
     if (!token) {
       client.disconnect(true);
       return;
@@ -91,8 +153,16 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       });
 
       const user = await this.prisma.user.findUnique({
-        where: { id: payload.sub, tenantId: payload.tenantId },
-        select: { id: true, tenantId: true, name: true },
+        where: {
+          id: payload.sub,
+          tenantId: payload.tenantId,
+        },
+
+        select: {
+          id: true,
+          tenantId: true,
+          name: true,
+        },
       });
 
       if (!user) {
@@ -107,71 +177,66 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         tenantId: payload.tenantId,
       } satisfies AuthenticatedSocketUser;
 
-      // NOVO: entra na room global do tenant
       await client.join(`tenant:${payload.tenantId}`);
 
       console.log(`Cliente conectado: ${client.id} - ${user.name}`);
     } catch (error) {
-      console.log('Token inválido no socket:', error);
+      console.error('Token inválido no socket:', error);
+
       client.disconnect(true);
     }
   }
-  handleDisconnect(client: Socket) {
+
+  handleDisconnect(client: Socket): void {
     this.removeSocketFromAllRooms(client);
 
     console.log('Cliente desconectado:', client.id);
   }
 
+  // ==========================================================
+  // CREATE ROOM
+  // ==========================================================
+
   @SubscribeMessage('chat:create_room')
   async handleCreateRoom(
-    @MessageBody() data: { name?: string },
-    @ConnectedSocket() client: Socket,
-  ): Promise<SocketAckResponse> {
-    const currentUser = this.getAuthenticatedUser(client);
+    @MessageBody()
+    data: {
+      name?: string;
+      channelId?: string;
+    },
 
-    if (!currentUser) {
-      return {
-        success: false,
-        message: 'Usuário não autenticado',
-      };
-    }
-    const tenantId = currentUser.tenantId;
-    if (!tenantId) {
-      return {
-        success: false,
-        message: 'Tenant não encontrado',
-      };
+    @ConnectedSocket()
+    client: Socket,
+  ): Promise<SocketAckResponse> {
+    const user = this.getAuthenticatedUser(client);
+
+    if (!user) {
+      return this.error('Usuário não autenticado');
     }
 
     const roomName = data.name?.trim();
 
     if (!roomName) {
-      return {
-        success: false,
-        message: 'Nome da sala é obrigatório',
-      };
+      return this.error('Nome da sala é obrigatório');
     }
 
     const room = await this.chatService.roomCreate({
       name: roomName,
-      tenantId,
+      tenantId: user.tenantId,
+      channelId: data.channelId,
     });
-    const roomId: string = room.id;
 
-    await client.join(roomId);
+    await client.join(room.id);
 
-    this.addOnlineUserToRoom(roomId, client);
-    this.emitOnlineUsers(roomId);
+    this.addOnlineUserToRoom(room.id, client);
 
-    this.server.to(`tenant:${tenantId}`).emit('chat:room_created', {
+    this.emitOnlineUsers(room.id);
+
+    this.server.to(`tenant:${user.tenantId}`).emit('chat:room_created', {
       id: room.id,
       name: room.name,
       tenantId: room.tenantId,
     });
-
-    console.log(`Acesso a tenant com sucesso: ${tenantId}`);
-    console.log(`Sala criada com sucesso: ${room.name}`);
-    console.log(`Cliente ${client.id} entrou na sala ID: ${room.id}`);
 
     return {
       success: true,
@@ -184,80 +249,52 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     };
   }
 
+  // ==========================================================
+  // JOIN ROOM
+  // ==========================================================
+
   @SubscribeMessage('chat:join_room')
   async handleJoinRoom(
-    @MessageBody() data: { room?: string; name?: string },
-    @ConnectedSocket() client: Socket,
-  ): Promise<SocketAckResponse> {
-    const currentUser = this.getAuthenticatedUser(client);
+    @MessageBody()
+    data: {
+      room?: string;
+      name?: string;
+    },
 
-    if (!currentUser) {
-      return {
-        success: false,
-        message: 'Usuário não autenticado',
-      };
+    @ConnectedSocket()
+    client: Socket,
+  ): Promise<SocketAckResponse> {
+    const user = this.getAuthenticatedUser(client);
+
+    if (!user) {
+      return this.error('Usuário não autenticado');
     }
-    const tenantId = currentUser.tenantId;
-    if (!tenantId) {
-      return {
-        success: false,
-        message: 'Tenant não encontrado',
-      };
-    }
-    console.log('JOIN BACKEND DEBUG:', {
-      data,
-      room: data.room,
-      name: data.name,
-      tenantId,
-      currentUser,
-    });
 
     const roomIdentifier = data.room?.trim() || data.name?.trim();
 
     if (!roomIdentifier) {
-      return {
-        success: false,
-        message: 'Sala não informada',
-      };
+      return this.error('Sala não informada');
     }
 
     const room = await this.chatService.findRoomByIdOrName(
       roomIdentifier,
-      tenantId,
+      user.tenantId,
     );
 
     if (!room) {
-      return {
-        success: false,
-        message: 'Sala não encontrada',
-      };
+      return this.error('Sala não encontrada');
     }
 
     await client.join(room.id);
-    const socketsInRoom = await this.server.in(room.id).fetchSockets();
-
-    console.log('SOCKETS NA ROOM DEPOIS DO JOIN:', {
-      roomId: room.id,
-      total: socketsInRoom.length,
-      users: socketsInRoom.map((socket) => socket.data.user),
-    });
 
     this.addOnlineUserToRoom(room.id, client);
+
     this.emitOnlineUsers(room.id);
 
     await this.chatService.addParticipant({
       conversationId: room.id,
-      userId: currentUser.id,
-      tenantId,
-    });
-
-    console.log(`Acesso a tenant com sucesso: ${tenantId}`);
-    console.log(`Cliente ${client.id} entrou na sala ${room.name}`);
-    console.log(`Room ID usada no socket: ${room.id}`);
-    console.log('JOIN ROOM DEBUG:', {
-      roomIdentifier,
-      tenantId,
-      user: currentUser,
+      userId: user.id,
+      tenantId: user.tenantId,
     });
 
     return {
@@ -271,66 +308,47 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     };
   }
 
+  // ==========================================================
+  // LEAVE ROOM
+  // ==========================================================
+
   @SubscribeMessage('chat:leave_room')
   async handleLeaveRoom(
-    @MessageBody() data: { room?: string; name?: string },
-    @ConnectedSocket() client: Socket,
-  ): Promise<SocketAckResponse> {
-    const currentUser = this.getAuthenticatedUser(client);
+    @MessageBody()
+    data: {
+      room?: string;
+      name?: string;
+    },
 
-    if (!currentUser) {
-      return {
-        success: false,
-        message: 'Usuário não autenticado',
-      };
+    @ConnectedSocket()
+    client: Socket,
+  ): Promise<SocketAckResponse> {
+    const user = this.getAuthenticatedUser(client);
+
+    if (!user) {
+      return this.error('Usuário não autenticado');
     }
-    const tenantId = currentUser.tenantId;
-    if (!tenantId) {
-      return {
-        success: false,
-        message: 'Tenant não encontrado',
-      };
-    }
+
     const roomIdentifier = data.room?.trim() || data.name?.trim();
+
     if (!roomIdentifier) {
-      return {
-        success: false,
-        message: 'Sala não informada',
-      };
+      return this.error('Sala não informada');
     }
 
     const room = await this.chatService.findRoomByIdOrName(
       roomIdentifier,
-      tenantId,
+      user.tenantId,
     );
 
     if (!room) {
-      return {
-        success: false,
-        message: 'Sala não encontrada',
-      };
+      return this.error('Sala não encontrada');
     }
-    console.log('LEAVE ROOM DEBUG:', {
-      roomRecebida: data.room,
-      tenantId,
-      currentUser,
-    });
 
     await client.leave(room.id);
 
-    const socketsInRoom = await this.server.in(room.id).fetchSockets();
-
-    console.log('SOCKETS NA ROOM DEPOIS DO LEAVE:', {
-      roomId: room.id,
-      total: socketsInRoom.length,
-      users: socketsInRoom.map((socket) => socket.data.user),
-    });
-
     this.removeOnlineUserFromRoom(room.id, client);
-    this.emitOnlineUsers(room.id);
 
-    console.log(`Cliente ${client.id} saiu da sala ${room.name}`);
-    console.log(`Room ID removida do socket: ${room.id}`);
+    this.emitOnlineUsers(room.id);
 
     return {
       success: true,
@@ -343,183 +361,231 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     };
   }
 
+  // ==========================================================
+  // SEND MESSAGE
+  // ==========================================================
+
   @SubscribeMessage('chat:send_message')
   async handleSendMessage(
-    @MessageBody() data: SendMessagePayload,
-    @ConnectedSocket() client: Socket,
-  ): Promise<SocketAckResponse> {
-    const currentUser = this.getAuthenticatedUser(client);
+    @MessageBody()
+    data: SendMessagePayload,
 
-    if (!currentUser) {
-      return {
-        success: false,
-        message: 'Usuário não autenticado',
-      };
-    }
-    const tenantId = currentUser.tenantId;
-    if (!tenantId) {
-      return {
-        success: false,
-        message: 'Tenant não encontrado',
-      };
+    @ConnectedSocket()
+    client: Socket,
+  ): Promise<SocketAckResponse> {
+    const user = this.getAuthenticatedUser(client);
+
+    if (!user) {
+      return this.error('Usuário não autenticado');
     }
 
     const room = data.room?.trim();
+
     const content = data.content?.trim();
 
     if (!room) {
-      return {
-        success: false,
-        message: 'Sala não informada',
-      };
+      return this.error('Sala não informada');
     }
 
     if (!content) {
-      return {
-        success: false,
-        message: 'Mensagem vazia',
-      };
+      return this.error('Mensagem vazia');
     }
 
     try {
+      const conversation = await this.chatService.findConversationById(
+        user.tenantId,
+        room,
+      );
+
+      if (!conversation) {
+        return this.error('Conversa não encontrada');
+      }
+
+      // ======================================================
+      // EXTERNO
+      // ======================================================
+
+      if (conversation.channelId) {
+        await this.chatService.sendExternalMessage({
+          conversationId: conversation.id,
+          tenantId: user.tenantId,
+          authorId: user.id,
+          message: content,
+        });
+
+        return {
+          success: true,
+          message: 'Mensagem externa enviada',
+        };
+      }
+
+      // ======================================================
+      // INTERNO
+      // ======================================================
+
       const savedMessage = await this.chatService.saveMessageByConversation({
-        conversationId: room,
-        tenantId: tenantId,
-        authorId: currentUser.id,
+        conversationId: conversation.id,
+        tenantId: user.tenantId,
+        authorId: user.id,
         content,
       });
 
-      const roomId: string = savedMessage.conversationId;
+      await this.ensureSocketInRoom(client, conversation.id);
 
-      if (!client.rooms.has(roomId)) {
-        console.warn(
-          'Socket não estava na room no send_message. Entrando agora:',
-          {
-            socketId: client.id,
-            roomId,
-            roomsAtuais: Array.from(client.rooms),
-          },
-        );
+      this.emitInternalMessage(conversation.id, savedMessage);
 
-        await client.join(roomId);
-      }
-
-      const payload = {
-        id: savedMessage.id,
-        tenantId: savedMessage.tenantId,
-        room: roomId,
-        conversationId: roomId,
-        authorId: savedMessage.authorId,
-        author: savedMessage.author
-          ? {
-              id: savedMessage.author.id,
-              name: savedMessage.author.name,
-              status: 'online',
-            }
-          : null,
-        content: savedMessage.content,
-        createdAt: savedMessage.createdAt,
-      };
-
-      console.log('Mensagem salva no banco:', savedMessage.id);
-      console.log('Emitindo para room:', roomId);
-
-      const socketsInRoom = await this.server.in(roomId).fetchSockets();
-
-      console.log('SOCKETS NA ROOM ANTES DO EMIT:', {
-        roomId,
-        total: socketsInRoom.length,
-        users: socketsInRoom.map((socket) => socket.data.user),
-      });
-
-      this.server.to(roomId).emit('chat:new_message', payload);
-      const participants = await this.chatService.findConversationParticipants(
-        roomId,
-        tenantId,
-        currentUser.id,
+      await this.notifyOfflineParticipants(
+        conversation.id,
+        user.tenantId,
+        user.id,
+        savedMessage,
       );
-      const onlineUsers = this.onlineUsersByRoom.get(roomId);
-      console.log(
-        'PARTICIPANTES:',
-        participants.map((p) => p.user.name),
-      );
-      console.log(
-        'ONLINE:',
-        onlineUsers ? Array.from(onlineUsers.values()).map((u) => u.name) : [],
-      );
-      for (const participant of participants) {
-        console.log(
-          'Verificando:',
-          participant.user.name,
-          onlineUsers?.has(participant.user.id),
-        );
-        const onlineUser = onlineUsers?.get(participant.user.id);
-        if (!onlineUser) {
-          await this.notificationService.sendPushToUser(
-            participant.user.id,
-            `Nova mensagem de ${savedMessage.author?.name ?? 'Cliente'}`,
-            savedMessage.content ?? 'Você recebeu uma nova mensagem',
-          );
-        }
-      }
 
       return {
         success: true,
         message: 'Mensagem enviada',
       };
     } catch (error) {
-      console.log('Erro ao salvar mensagem:', error);
+      console.error('Erro ao enviar mensagem:', error);
 
-      return {
-        success: false,
-        message: 'Erro ao salvar mensagem',
-      };
+      return this.error('Erro ao enviar mensagem');
     }
   }
 
+  // ==========================================================
+  // SEND EXTERNAL MESSAGE
+  // ==========================================================
+
+  @SubscribeMessage('chat:send_external_message')
+  async handleSendExternalMessage(
+    @MessageBody()
+    data: {
+      room: string;
+      content: string;
+    },
+
+    @ConnectedSocket()
+    client: Socket,
+  ) {
+    const user = this.getAuthenticatedUser(client);
+
+    if (!user) {
+      return this.error('Usuário não autenticado');
+    }
+
+    const room = data.room?.trim();
+
+    const content = data.content?.trim();
+
+    if (!room) {
+      return this.error('Conversa não informada');
+    }
+
+    if (!content) {
+      return this.error('Mensagem vazia');
+    }
+
+    try {
+      const conversation = await this.chatService.findConversationById(
+        user.tenantId,
+        room,
+      );
+
+      if (!conversation) {
+        return this.error('Conversa não encontrada');
+      }
+
+      if (!conversation.channelId) {
+        return this.error('Essa conversa não é externa');
+      }
+
+      const savedMessage = await this.chatService.sendExternalMessage({
+        conversationId: conversation.id,
+        tenantId: user.tenantId,
+        authorId: user.id,
+        message: content,
+      });
+
+      return {
+        success: true,
+        message: 'Mensagem externa enviada',
+        data: {
+          id: savedMessage.id,
+          conversationId: savedMessage.conversationId,
+          content: savedMessage.content,
+          authorId: savedMessage.authorId,
+          author: savedMessage.author,
+          createdAt: savedMessage.createdAt,
+        },
+      };
+    } catch (error) {
+      console.error('Erro ao enviar mensagem externa:', error);
+
+      return this.error('Erro ao enviar mensagem externa');
+    }
+  }
+
+  // ==========================================================
+  // TYPING START
+  // ==========================================================
+
   @SubscribeMessage('chat:typing_start')
   async handleTypingStart(
-    @MessageBody() data: SocketTypingStart,
-    @ConnectedSocket() client: Socket,
-  ): Promise<SocketAckResponse> {
-    const currentUser = this.getAuthenticatedUser(client);
+    @MessageBody()
+    data: SocketTypingPayload,
 
-    if (!currentUser) {
-      return {
-        success: false,
-        message: 'Usuário não autenticado',
-      };
+    @ConnectedSocket()
+    client: Socket,
+  ): Promise<SocketAckResponse> {
+    return this.handleTyping(data, client, 'chat:user_typing');
+  }
+
+  // ==========================================================
+  // TYPING STOP
+  // ==========================================================
+
+  @SubscribeMessage('chat:typing_stop')
+  async handleTypingStop(
+    @MessageBody()
+    data: SocketTypingPayload,
+
+    @ConnectedSocket()
+    client: Socket,
+  ): Promise<SocketAckResponse> {
+    return this.handleTyping(data, client, 'chat:user_stop_typing');
+  }
+
+  private async handleTyping(
+    data: SocketTypingPayload,
+    client: Socket,
+    event: string,
+  ): Promise<SocketAckResponse> {
+    const user = this.getAuthenticatedUser(client);
+
+    if (!user) {
+      return this.error('Usuário não autenticado');
     }
-    const tenantId = currentUser.tenantId;
-    if (!tenantId) {
-      return {
-        success: false,
-        message: 'Tenant não encontrado',
-      };
-    }
+
     const room = data.room?.trim();
+
     if (!room) {
-      return {
-        success: false,
-        message: 'Sala não informada',
-      };
+      return this.error('Sala não informada');
     }
-    const roomFound = await this.chatService.findRoomByIdOrName(room, tenantId);
+
+    const roomFound = await this.chatService.findRoomByIdOrName(
+      room,
+      user.tenantId,
+    );
 
     if (!roomFound) {
-      return {
-        success: false,
-        message: 'Sala não encontrada',
-      };
+      return this.error('Sala não encontrada');
     }
 
-    const payload: SocketTypingStart = {
+    client.to(roomFound.id).emit(event, {
       room: roomFound.id,
-      tenantId: currentUser.tenantId,
-      author: currentUser.name,
-    };
-
-    client.to(roomFound.id).emit('chat:user_typing', payload);
+      tenantId: user.tenantId,
+      author: user.name,
+    });
 
     return {
       success: true,
@@ -527,224 +593,55 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     };
   }
 
-  @SubscribeMessage('chat:typing_stop')
-  async handleTypingStop(
-    @MessageBody() data: SocketTypingStart,
-    @ConnectedSocket() client: Socket,
-  ): Promise<SocketAckResponse> {
-    const currentUser = this.getAuthenticatedUser(client);
+  // ==========================================================
+  // WHATSAPP QR
+  // ==========================================================
 
-    if (!currentUser) {
-      return {
-        success: false,
-        message: 'Usuário não autenticado',
-      };
-    }
-    const tenantId = currentUser.tenantId;
+  private emitWhatsAppQr(channelId: string, qrCode: string): void {
+    console.log('ENVIANDO QR WHATSAPP:', channelId);
 
-    if (!tenantId) {
-      return {
-        success: false,
-        message: 'Tenant não encontrado',
-      };
-    }
-    const room = data.room?.trim();
-    if (!room) {
-      return {
-        success: false,
-        message: 'Sala não informada',
-      };
-    }
-    const roomFound = await this.chatService.findRoomByIdOrName(room, tenantId);
+    // Por enquanto enviamos para o tenant.
+    //
+    // Depois vamos melhorar isso para o tenant
+    // do channel, evitando qualquer possibilidade
+    // de enviar para a empresa errada.
 
-    if (!roomFound) {
-      return {
-        success: false,
-        message: 'Sala não encontrada',
-      };
-    }
+    // ESTE EVENTO SERÁ FINALIZADO JUNTO COM
+    // A ESTRUTURA DE CHANNEL/SESSION.
 
-    const payload: SocketTypingStart = {
-      room: roomFound.id,
-      tenantId: currentUser.tenantId,
-      author: currentUser.name,
-    };
-
-    client.to(roomFound.id).emit('chat:user_stop_typing', payload);
-
-    return {
-      success: true,
-      message: 'Typing Stop enviado',
-    };
-  }
-
-  private extractTokenFromSocket(client: Socket): string | null {
-    const authToken = client.handshake.auth?.token;
-
-    if (typeof authToken === 'string' && authToken.trim()) {
-      return authToken;
-    }
-
-    const authorization = client.handshake.headers.authorization;
-
-    if (typeof authorization === 'string') {
-      const [type, token] = authorization.split(' ');
-
-      if (type === 'Bearer' && token) {
-        return token;
-      }
-    }
-
-    return null;
-  }
-
-  private getAuthenticatedUser(client: Socket): AuthenticatedSocketUser | null {
-    const user = client.data.user as AuthenticatedSocketUser | undefined;
-
-    if (!user) {
-      return null;
-    }
-
-    return user;
-  }
-
-  private addOnlineUserToRoom(roomId: string, client: Socket) {
-    const user = this.getAuthenticatedUser(client);
-
-    if (!user) return;
-    let usersInRoom = this.onlineUsersByRoom.get(roomId);
-
-    if (!usersInRoom) {
-      usersInRoom = new Map<string, OnlineUserWithSockets>();
-      this.onlineUsersByRoom.set(roomId, usersInRoom);
-    }
-
-    let onlineUser = usersInRoom.get(user.id);
-
-    if (!onlineUser) {
-      onlineUser = {
-        id: user.id,
-        name: user.name,
-        tenantId: user.tenantId,
-        status: 'online',
-        socketIds: new Set<string>(),
-      };
-
-      usersInRoom.set(user.id, onlineUser);
-    }
-
-    onlineUser.socketIds.add(client.id);
-
-    let roomsFromSocket = this.roomsBySocket.get(client.id);
-
-    if (!roomsFromSocket) {
-      roomsFromSocket = new Set<string>();
-      this.roomsBySocket.set(client.id, roomsFromSocket);
-    }
-
-    roomsFromSocket.add(roomId);
-  }
-
-  private removeOnlineUserFromRoom(roomId: string, client: Socket) {
-    const user = this.getAuthenticatedUser(client);
-
-    if (!user) return;
-
-    const usersInRoom = this.onlineUsersByRoom.get(roomId);
-
-    if (!usersInRoom) return;
-
-    const onlineUser = usersInRoom.get(user.id);
-
-    if (!onlineUser) return;
-
-    onlineUser.socketIds.delete(client.id);
-
-    if (onlineUser.socketIds.size === 0) {
-      usersInRoom.delete(user.id);
-    }
-
-    if (usersInRoom.size === 0) {
-      this.onlineUsersByRoom.delete(roomId);
-    }
-
-    const roomsFromSocket = this.roomsBySocket.get(client.id);
-
-    if (roomsFromSocket) {
-      roomsFromSocket.delete(roomId);
-
-      if (roomsFromSocket.size === 0) {
-        this.roomsBySocket.delete(client.id);
-      }
-    }
-  }
-
-  private removeSocketFromAllRooms(client: Socket) {
-    const roomsFromSocket = this.roomsBySocket.get(client.id);
-
-    if (!roomsFromSocket) return;
-
-    const roomIds = Array.from(roomsFromSocket);
-
-    for (const roomId of roomIds) {
-      this.removeOnlineUserFromRoom(roomId, client);
-      this.emitOnlineUsers(roomId);
-    }
-
-    this.roomsBySocket.delete(client.id);
-  }
-
-  private emitOnlineUsers(roomId: string) {
-    console.log('ENTROU NO EMIT ONLINE USERS:', roomId);
-
-    const usersInRoom = this.onlineUsersByRoom.get(roomId);
-
-    const users: OnlineUser[] = usersInRoom
-      ? Array.from(usersInRoom.values()).map((user) => ({
-          id: user.id,
-          name: user.name,
-          tenantId: user.tenantId,
-          status: user.status,
-        }))
-      : [];
-
-    this.server.to(roomId).emit('chat:online_users', {
-      room: roomId,
-      users,
+    this.server.emit('whatsapp:qr', {
+      channelId,
+      qrCode,
     });
   }
-  emitNewMessage(
-    roomId: string,
-    message: {
-      id: string;
-      tenantId: string;
-      conversationId: string;
-      authorId: string | null;
-      author?: {
-        id: string;
-        name: string;
-      } | null;
 
-      type: string;
-      content: string | null;
+  // ==========================================================
+  // WHATSAPP CONNECTION
+  // ==========================================================
 
-      fileUrl: string | null;
-      fileName: string | null;
-      mimeType: string | null;
-      fileSize: number | null;
-      audioDuration: number | null;
+  private emitWhatsAppConnection(
+    channelId: string,
+    status: 'connected' | 'disconnected',
+  ): void {
+    this.server.emit('whatsapp:connection', {
+      channelId,
+      status,
+    });
+  }
 
-      createdAt: Date;
-    },
-  ) {
+  // ==========================================================
+  // INTERNAL MESSAGE
+  // ==========================================================
+
+  private emitInternalMessage(roomId: string, message: any): void {
     const payload = {
       id: message.id,
       tenantId: message.tenantId,
-
       room: roomId,
       conversationId: message.conversationId,
 
       authorId: message.authorId,
+
       author: message.author
         ? {
             id: message.author.id,
@@ -767,10 +664,308 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     this.server.to(roomId).emit('chat:new_message', payload);
   }
+
+  // ==========================================================
+  // NEW MESSAGE
+  // ==========================================================
+
+  emitNewMessage(roomId: string, message: any): void {
+    const payload = {
+      id: message.id,
+
+      tenantId: message.tenantId,
+
+      room: roomId,
+
+      conversationId: message.conversationId,
+
+      authorId: message.authorId,
+
+      author: message.author
+        ? {
+            id: message.author.id,
+            name: message.author.name,
+            status: 'online',
+          }
+        : null,
+
+      type: message.type,
+      content: message.content,
+
+      fileUrl: message.fileUrl,
+      fileName: message.fileName,
+      mimeType: message.mimeType,
+      fileSize: message.fileSize,
+      audioDuration: message.audioDuration,
+
+      createdAt: message.createdAt,
+    };
+
+    this.server.to(roomId).emit('chat:new_message', payload);
+  }
+
+  // ==========================================================
+  // CONVERSATION UPDATED
+  // ==========================================================
   emitRoomCreatedToTenant(
     tenantId: string,
-    room: { id: string; name: string; tenantId: string },
-  ) {
+    room: {
+      id: string;
+      name: string;
+      tenantId: string;
+    },
+  ): void {
     this.server.to(`tenant:${tenantId}`).emit('chat:room_created', room);
+  }
+  emitConversationUpdated(
+    tenantId: string,
+    conversation: any,
+    message: any,
+  ): void {
+    const payload = {
+      conversationId: conversation.id,
+
+      tenantId: conversation.tenantId,
+
+      conversation: {
+        id: conversation.id,
+        tenantId: conversation.tenantId,
+
+        name: conversation.name,
+
+        contact: conversation.contact
+          ? {
+              id: conversation.contact.id,
+
+              name: conversation.contact.name,
+            }
+          : null,
+      },
+
+      lastMessage: {
+        id: message.id,
+        type: message.type,
+        content: message.content,
+
+        fileUrl: message.fileUrl,
+        fileName: message.fileName,
+        mimeType: message.mimeType,
+        fileSize: message.fileSize,
+        audioDuration: message.audioDuration,
+
+        createdAt: message.createdAt,
+
+        authorId: message.authorId,
+      },
+    };
+
+    this.server
+      .to(`tenant:${tenantId}`)
+      .emit('chat:conversation_updated', payload);
+  }
+
+  // ==========================================================
+  // ONLINE USERS
+  // ==========================================================
+
+  private addOnlineUserToRoom(roomId: string, client: Socket): void {
+    const user = this.getAuthenticatedUser(client);
+
+    if (!user) {
+      return;
+    }
+
+    let usersInRoom = this.onlineUsersByRoom.get(roomId);
+
+    if (!usersInRoom) {
+      usersInRoom = new Map<string, OnlineUserWithSockets>();
+
+      this.onlineUsersByRoom.set(roomId, usersInRoom);
+    }
+
+    let onlineUser = usersInRoom.get(user.id);
+
+    if (!onlineUser) {
+      onlineUser = {
+        id: user.id,
+        name: user.name,
+        tenantId: user.tenantId,
+        status: 'online',
+        socketIds: new Set<string>(),
+      };
+
+      usersInRoom.set(user.id, onlineUser);
+    }
+
+    onlineUser.socketIds.add(client.id);
+
+    let rooms = this.roomsBySocket.get(client.id);
+
+    if (!rooms) {
+      rooms = new Set<string>();
+
+      this.roomsBySocket.set(client.id, rooms);
+    }
+
+    rooms.add(roomId);
+  }
+
+  private removeOnlineUserFromRoom(roomId: string, client: Socket): void {
+    const user = this.getAuthenticatedUser(client);
+
+    if (!user) {
+      return;
+    }
+
+    const users = this.onlineUsersByRoom.get(roomId);
+
+    if (!users) {
+      return;
+    }
+
+    const onlineUser = users.get(user.id);
+
+    if (!onlineUser) {
+      return;
+    }
+
+    onlineUser.socketIds.delete(client.id);
+
+    if (onlineUser.socketIds.size === 0) {
+      users.delete(user.id);
+    }
+
+    if (users.size === 0) {
+      this.onlineUsersByRoom.delete(roomId);
+    }
+
+    const rooms = this.roomsBySocket.get(client.id);
+
+    if (rooms) {
+      rooms.delete(roomId);
+
+      if (rooms.size === 0) {
+        this.roomsBySocket.delete(client.id);
+      }
+    }
+  }
+
+  private emitOnlineUsers(roomId: string): void {
+    const users = this.onlineUsersByRoom.get(roomId);
+
+    const onlineUsers: OnlineUser[] = users
+      ? Array.from(users.values()).map((user) => ({
+          id: user.id,
+          name: user.name,
+          tenantId: user.tenantId,
+          status: user.status,
+        }))
+      : [];
+
+    this.server.to(roomId).emit('chat:online_users', {
+      room: roomId,
+      users: onlineUsers,
+    });
+  }
+
+  private removeSocketFromAllRooms(client: Socket): void {
+    const rooms = this.roomsBySocket.get(client.id);
+
+    if (!rooms) {
+      return;
+    }
+
+    for (const roomId of rooms) {
+      this.removeOnlineUserFromRoom(roomId, client);
+
+      this.emitOnlineUsers(roomId);
+    }
+
+    this.roomsBySocket.delete(client.id);
+  }
+
+  // ==========================================================
+  // NOTIFICAÇÕES
+  // ==========================================================
+
+  private async notifyOfflineParticipants(
+    conversationId: string,
+    tenantId: string,
+    currentUserId: string,
+    message: any,
+  ): Promise<void> {
+    const participants = await this.chatService.findConversationParticipants(
+      conversationId,
+      tenantId,
+      currentUserId,
+    );
+
+    const onlineUsers = this.onlineUsersByRoom.get(conversationId);
+
+    for (const participant of participants) {
+      if (!onlineUsers?.has(participant.user.id)) {
+        await this.notificationService.sendPushToUser(
+          participant.user.id,
+          `Nova mensagem de ${message.author?.name ?? 'Usuário'}`,
+          message.content ?? 'Você recebeu uma nova mensagem',
+        );
+      }
+    }
+  }
+
+  // ==========================================================
+  // SOCKET ROOM
+  // ==========================================================
+
+  private async ensureSocketInRoom(
+    client: Socket,
+    roomId: string,
+  ): Promise<void> {
+    if (client.rooms.has(roomId)) {
+      return;
+    }
+
+    await client.join(roomId);
+
+    this.addOnlineUserToRoom(roomId, client);
+  }
+
+  // ==========================================================
+  // AUTH
+  // ==========================================================
+
+  private extractTokenFromSocket(client: Socket): string | null {
+    const authToken = client.handshake.auth?.token;
+
+    if (typeof authToken === 'string' && authToken.trim()) {
+      return authToken;
+    }
+
+    const authorization = client.handshake.headers.authorization;
+
+    if (typeof authorization === 'string') {
+      const [type, token] = authorization.split(' ');
+
+      if (type === 'Bearer' && token) {
+        return token;
+      }
+    }
+
+    return null;
+  }
+
+  private getAuthenticatedUser(client: Socket): AuthenticatedSocketUser | null {
+    return (client.data.user as AuthenticatedSocketUser | undefined) ?? null;
+  }
+
+  // ==========================================================
+  // ERROR
+  // ==========================================================
+
+  private error(message: string): SocketAckResponse {
+    return {
+      success: false,
+      message,
+    };
   }
 }
